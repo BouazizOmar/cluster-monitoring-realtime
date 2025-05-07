@@ -20,7 +20,7 @@ __pycache__/
 # Binaries / outputs
 *.jar
 archives/
-spark_job/checkpoints/
+spark-job/checkpoints/
 llm-pipeline/dataPipeline/output/
 
 # Secrets & configs
