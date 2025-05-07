@@ -1,0 +1,75 @@
+Prompt:
+
+You are a cloud operations specialist. You will be given a system monitoring report for multiple virtual machines. For each VM:
+
+  1. Compare its metrics against healthy baselines.
+  2. Identify any anomalies.
+  3. Choose the single most appropriate action from:
+     - NO_ACTION
+     - RESTART_SERVICES
+     - RESTART_VM
+     - MIGRATE_VM
+     - SCALE_UP
+  4. Explain your reasoning in 1–2 sentences.
+
+Report format:
+
+---
+VM Name: <string>
+CPU Idle Time: <seconds>
+Memory Used: <percent> of <total GB> (Available: <GB>)
+Disk I/O Time: <seconds>
+Failed Services (Count: <n>): [<service1>, <service2>, …]
+Detected Anomalies: <anomaly_codes>
+---
+
+Your output must follow this template exactly:
+
+---
+VM Name: <name>  
+Recommended Action: <one of the five options>  
+Reason: <concise explanation>  
+---
+
+System Monitoring Report (2025‑04‑06 16:34:00 UTC):
+
+VM Lubuntu:
+  - CPU Idle: 986.9 seconds  
+  - Memory used: 21.8% of 3.7GB (Available: 2.9GB)  
+  - Disk I/O time: 50.6 seconds  
+  - Failed services: ['NetworkManager.service', 'systemd-journald.service', 'systemd-logind.service'] (Count: 3)  
+
+VM Lubuntu V2:
+  - CPU Idle: 975.8 seconds  
+  - Memory used: 21.5% of 3.7GB (Available: 2.9GB)  
+  - Disk I/O time: 24.0 seconds  
+  - Failed services: ['systemd-journald.service', 'systemd-logind.service', 'NetworkManager.service'] (Count: 3)  
+
+VM Ubuntu:
+  - CPU Idle: 917.9 seconds  
+  - Memory used: 23.5% of 6.7GB (Available: 5.1GB)  
+  - Disk I/O time: 38.5 seconds  
+  - Failed services: ['NetworkManager.service', 'nginx.service', 'systemd-journald.service', '…'] (Count: 4)  
+
+Now analyze and recommend.
+
+
+Response:
+
+---
+VM Lubuntu:
+ - Recommended Action: Investigate and restart the failed services.
+ - Reason: The CPU idle time is high, and the same services are failing across both Lubuntu VMs, indicating a system-wide issue.
+---
+
+---
+VM Lubuntu V2:
+ - Recommended Action: Investigate and restart the failed services.
+ - Reason: The CPU idle time is high, and the same services are failing across both Lubuntu VMs, indicating a system-wide issue.
+---
+
+---
+VM Ubuntu:
+ - Recommended Action: Investigate and restart the failed services.
+ - Reason: The CPU idle time is high, and multiple services are failing, suggesting a system-wide issue.
+---

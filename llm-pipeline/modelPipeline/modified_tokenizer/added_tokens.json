@@ -1,0 +1,14 @@
+{
+  "### Instruction:": 32769,
+  "### Response:": 32770,
+  "MIGRATE_VM": 32778,
+  "NO_ACTION": 32775,
+  "RESTART_SERVICES": 32776,
+  "RESTART_VM": 32777,
+  "SCALE_UP": 32779,
+  "[CPU]": 32772,
+  "[DISK]": 32774,
+  "[MEMORY]": 32773,
+  "[PAD]": 32768,
+  "[VM]": 32771
+}

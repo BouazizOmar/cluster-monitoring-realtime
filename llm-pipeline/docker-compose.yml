@@ -1,0 +1,131 @@
+version: '3.7'
+
+services:
+  fast-data-dev:
+    image: dougdonohoe/fast-data-dev
+    ports:
+      - "3181:3181"
+      - "3040:3040"
+      - "7081:7081"
+      - "7082:7082"
+      - "7083:7083"
+      - "7092:9092"
+      - "29092:29092"
+      - "8081:8081"
+    environment:
+      - ZK_PORT=3181
+      - WEB_PORT=3040
+      - REGISTRY_PORT=8081
+      - REST_PORT=7082
+      - CONNECT_PORT=7083
+      - BROKER_PORT=9092
+      - ADV_HOST=fast-data-dev
+      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      - KAFKA_LISTENERS=PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092
+      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://fast-data-dev:9092,PLAINTEXT_HOST://localhost:29092
+      - KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT
+    healthcheck:
+      test: ["CMD-SHELL", "nc -zv localhost 9092 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - monitoring
+
+  minio:
+    image: minio/minio
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    command: ["server", "/data", "--console-address", ":9001"]
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - monitoring
+
+  prometheus-kafka-adapter:
+    image: telefonica/prometheus-kafka-adapter:1.9.0
+    platform: linux/amd64
+    ports:
+      - "0.0.0.0:8080:8080"
+    environment:
+      - KAFKA_BROKER_LIST=fast-data-dev:9092
+      - KAFKA_TOPIC=prometheus_metrics
+      - HTTP_ENDPOINT="/receive"
+      - SERIALIZATION_FORMAT="json"
+    depends_on:
+      fast-data-dev:
+        condition: service_healthy
+    networks:
+      - monitoring
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./alertmanager/config.yml:/etc/alertmanager/config.yml
+    command:
+      - '--config.file=/etc/alertmanager/config.yml'
+    depends_on:
+      - fast-data-dev
+    networks:
+      - monitoring
+
+  prompt_api:
+    build:
+      context: ./llm-pipeline
+      dockerfile: Dockerfile.prompt_api
+    ports:
+      - "9005:9005"
+    environment:
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - monitoring
+    restart: always
+
+  inference_api:
+    build:
+      context: ./llm-pipeline
+      dockerfile: Dockerfile.inference_api
+    ports:
+      - "8000:8000"
+    networks:
+      - monitoring
+    restart: always
+
+  agent:
+    build:
+      context: ./llm-pipeline
+      dockerfile: Dockerfile.agent
+    environment:
+      - PROMPT_API_URL=http://prompt_api:9005/new_prompt
+      - INFER_API_URL=http://inference_api:8000/infer
+    depends_on:
+      - prompt_api
+      - inference_api
+    networks:
+      - monitoring
+    restart: always
+
+volumes:
+  minio-data:
+    external: true
+    name: setup-minio_minio-data
+
+networks:
+  monitoring:
+    driver: bridge
