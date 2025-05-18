@@ -1,3 +1,7 @@
+"""
+Schema metadata definition for the galaxy schema
+"""
+
 def get_schema_metadata():
     """Return the hardcoded metadata about the galaxy schema structure."""
     metadata = {
@@ -109,4 +113,4 @@ def get_schema_metadata():
             "time_granularity": "Metrics can be analyzed at minute, hour, and day levels"
         }
     }
-    return metadata 
+    return metadata

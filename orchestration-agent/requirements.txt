@@ -1,0 +1,9 @@
+langchain>=0.3.25
+langchain-openai>=0.3.16
+langchain-community>=0.3.24
+langgraph>=0.0.26
+openai>=1.68.2
+pydantic>=2.7.4
+python-dotenv==1.0.0
+aiohttp>=3.8.5
+asyncio-mqtt>=0.13.0

@@ -1,5 +1,6 @@
 # ignore all local env files
 **/.env
+**/.env.*
 
 # Python caches
 __pycache__/
@@ -21,7 +22,7 @@ __pycache__/
 *.jar
 archives/
 spark-job/checkpoints/
-llm-pipeline/dataPipeline/output/
+llm-pipeline/data-pipeline/output/
 
 # Secrets & configs
 inventory.ini
@@ -29,3 +30,43 @@ setup_ssh_keys.sh
 
 # Logs
 *.log
+
+# Cloud provider credentials
+**/credentials.json
+**/application_default_credentials.json
+**/service-account-key.json
+
+# Databricks
+.databrickscfg
+**/databricks-cli.json
+
+# Docker
+.docker/
+**/docker-credentials.json
+
+# PyPI
+.pypirc
+**/pypi-credentials.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Additional sensitive files
+**/secrets.yaml
+**/secrets.yml
+**/secrets.json
+**/config.local.yaml
+**/config.local.yml
+**/config.local.json
+**/settings.local.yaml
+**/settings.local.yml
+**/settings.local.json
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup

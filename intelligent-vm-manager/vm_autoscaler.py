@@ -5,464 +5,328 @@ import time
 import logging
 import sys
 import os
-import json
 from pathlib import Path
+import requests
 from typing import Optional, Dict, Any
 
+# VM states
+VM_STATE_POWEROFF = "poweroff"
+VM_STATE_RUNNING = "running"
+VM_STATE_SAVED = "saved"
+VM_STATE_PAUSED = "paused"
 
-# Enhanced VM resizer: snapshot → save state → drain → sync → stop → modify → restore state → health-check → rollback
+# Default SSH settings
+DEFAULT_SSH_PORT = 22
+DEFAULT_SSH_TIMEOUT = 30
 
 def setup_logger(log_file: str = 'vm_resizer.log') -> logging.Logger:
+    """Configure and return a logger with file and console handlers."""
     logger = logging.getLogger('VMResizer')
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
+
+    # Create logs directory if it doesn't exist
     log_dir = Path('logs')
     log_dir.mkdir(exist_ok=True)
+
+    # File handler
     fh = logging.FileHandler(log_dir / log_file)
     fmt = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     fh.setFormatter(fmt)
     logger.addHandler(fh)
+
+    # Console handler
     ch = logging.StreamHandler()
     ch.setFormatter(fmt)
     logger.addHandler(ch)
+
     return logger
 
-
 class VMResizer:
-    def __init__(self, vm_name: str, cpus: int, memory: Optional[int],
-                 drain_script: Optional[str], sync_script: Optional[str],
-                 health_url: Optional[str], timeout: int,
-                 use_save_state: bool = True,
-                 app_check_script: Optional[str] = None):
+    def __init__(
+            self,
+            vm_name: str,
+            cpus: int,
+            memory: int,
+            health_url: Optional[str] = None,
+            timeout: int = 300,
+            debug: bool = False,
+            wait_timeout: int = 60,
+            ssh_config: Optional[Dict[str, Any]] = None,
+            app_config: Optional[Dict[str, Any]] = None
+    ):
         self.vm = vm_name
         self.cpus = cpus
         self.memory = memory
-        self.drain_script = drain_script
-        self.sync_script = sync_script
         self.health_url = health_url
         self.timeout = timeout
         self.logger = setup_logger()
-        self.snapshot_name = None
-        self.use_save_state = use_save_state
-        self.app_check_script = app_check_script
-        self.saved_state_file = None
-        self.running_apps_before = None
+        self.debug = debug
+        self.wait_timeout = wait_timeout
+        
+        # Application configuration
+        self.app_config = app_config or {}
+        self.app_name = self.app_config.get('name', '')
+        self.app_start_command = self.app_config.get('start_command', '')
+        self.app_status_command = self.app_config.get('status_command', '')
+        self.app_process_name = self.app_config.get('process_name', '')
 
-    def _run(self, cmd: str, check: bool = True) -> subprocess.CompletedProcess:
+    def _run(self, cmd: str, check: bool = True, timeout: int = 60) -> subprocess.CompletedProcess:
+        """Run a command with proper error handling."""
         self.logger.info(f"Running: {cmd}")
-        return subprocess.run(cmd, shell=True, check=check, capture_output=True, text=True)
-
-    def take_snapshot(self):
-        ts = int(time.time())
-        name = f"resize_backup_{self.vm}_{ts}"
-        self._run(f"VBoxManage snapshot {self.vm} take {name}")
-        self.snapshot_name = name
-        self.logger.info(f"Snapshot created: {name}")
-
-    def capture_running_apps(self):
-        """Capture information about currently running apps in the VM"""
-        if not self.app_check_script:
-            self.logger.info("No app check script provided, skipping application state verification")
-            return
-
         try:
-            self.logger.info("Capturing running application state...")
-            result = self._run(f"bash {self.app_check_script} {self.vm}", check=False)
-
-            if result.returncode != 0:
-                self.logger.warning(f"App check script failed with code {result.returncode}")
-                self.logger.warning(f"Error: {result.stderr}")
-                self.logger.warning("Continuing without application state verification")
-                return
-
-            self.running_apps_before = result.stdout.strip()
-            self.logger.info(f"Current running apps: {self.running_apps_before}")
+            result = subprocess.run(
+                cmd,
+                shell=True,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+            
+            if result.stdout and self.debug:
+                self.logger.debug(f"Command stdout: {result.stdout}")
+            if result.stderr:
+                self.logger.warning(f"Command stderr: {result.stderr}")
+                
+            if check and result.returncode != 0:
+                raise subprocess.CalledProcessError(
+                    returncode=result.returncode,
+                    cmd=cmd,
+                    output=result.stdout,
+                    stderr=result.stderr
+                )
+                
+            return result
+        except subprocess.TimeoutExpired:
+            self.logger.error(f"Command timed out after {timeout} seconds: {cmd}")
+            raise
         except Exception as e:
-            self.logger.warning(f"Failed to capture running apps: {e}")
-            self.logger.warning("Continuing without application state verification")
+            self.logger.error(f"Error executing command '{cmd}': {str(e)}")
+            raise
 
-    def verify_running_apps(self) -> bool:
-        """Verify that previously running apps are still running"""
-        if not self.app_check_script or not self.running_apps_before:
-            self.logger.info("Skipping application verification (no script or initial state capture)")
-            return True
-
+    def get_vm_state(self) -> str:
+        """Get the current state of the VM."""
         try:
-            self.logger.info("Verifying applications are still running...")
-            result = self._run(f"bash {self.app_check_script} {self.vm}", check=False)
+            info = self._run(f"VBoxManage showvminfo {self.vm} --machinereadable").stdout
+            for line in info.splitlines():
+                if line.startswith('VMState='):
+                    return line.split('=')[1].strip('"')
+            return "unknown"
+        except Exception as e:
+            self.logger.error(f"Error getting VM state: {str(e)}")
+            return "error"
 
-            if result.returncode != 0:
-                self.logger.warning(f"App verification failed with code {result.returncode}")
-                self.logger.warning(f"Error: {result.stderr}")
-                # Continue anyway if health check passed
-                self.logger.warning("Assuming applications are OK since health check passed")
+    def wait_for_state(self, target_state: str, timeout: int = 60) -> bool:
+        """Wait for VM to reach a specific state within timeout."""
+        self.logger.info(f"Waiting for VM to reach '{target_state}' state")
+        end_time = time.time() + timeout
+
+        while time.time() < end_time:
+            current_state = self.get_vm_state()
+            if current_state == target_state:
                 return True
+            time.sleep(2)
 
-            running_apps_after = result.stdout.strip()
-
-            # Compare before and after states
-            if self.running_apps_before == running_apps_after:
-                self.logger.info("All applications still running correctly")
-                return True
-            else:
-                self.logger.warning(
-                    f"Application state changed. Before: {self.running_apps_before}, After: {running_apps_after}")
-                # Continue anyway if health check passed
-                self.logger.warning("Continuing since health check passed")
-                return True
-        except Exception as e:
-            self.logger.warning(f"Failed to verify apps: {e}")
-            self.logger.warning("Continuing since health check passed")
-            return True
-
-    def save_vm_state(self):
-        """Save the VM state instead of shutting down"""
-        if not self.use_save_state:
-            return
-
-        # First check if VM is running
-        vm_info = self._run(f"VBoxManage showvminfo {self.vm} --machinereadable", check=False)
-        if 'VMState="running"' not in vm_info.stdout:
-            self.logger.info(f"VM is not running, skipping save state")
-            return
-
-        self.logger.info(f"Saving state of VM {self.vm}")
-        save_dir = Path('vm_states')
-        save_dir.mkdir(exist_ok=True)
-
-        # Optional: create a timestamped file for reference
-        self.saved_state_file = save_dir / f"{self.vm}_state_{int(time.time())}.txt"
-        # Don't actually save the state to this file, this is just for reference
-
-        try:
-            # Use VBoxManage directly to save state
-            result = self._run(f"VBoxManage controlvm {self.vm} savestate", check=False)
-            if result.returncode != 0:
-                self.logger.error(f"Failed to save VM state: {result.stderr}")
-                self.logger.warning("Trying alternative shutdown method")
-                self._run(f"VBoxManage controlvm {self.vm} poweroff", check=False)
-            else:
-                self.logger.info(f"VM state saved successfully")
-
-            # Wait a moment to ensure the state change is registered
-            time.sleep(3)
-        except Exception as e:
-            self.logger.error(f"Error saving VM state: {e}")
-            self.logger.warning("Falling back to power off")
-            self._run(f"VBoxManage controlvm {self.vm} poweroff", check=False)
-            time.sleep(3)
-
-    def put_in_drain(self):
-        if not self.drain_script:
-            return
-        self.logger.info("Draining connections...")
-        try:
-            self._run(f"bash {self.drain_script} {self.vm}")
-        except Exception as e:
-            self.logger.warning(f"Drain script failed: {e}; proceeding anyway")
-
-    def sync_data(self):
-        if not self.sync_script:
-            return
-        self.logger.info("Synchronizing data...")
-        try:
-            self._run(f"bash {self.sync_script} {self.vm}")
-        except Exception as e:
-            self.logger.warning(f"Sync script failed: {e}; proceeding anyway")
-
-    def stop_vm(self):
-        if self.use_save_state:
-            # Already saved state
-            return
-
-        self.logger.info(f"Stopping VM {self.vm}")
-        # ACPI shutdown
-        self._run(f"VBoxManage controlvm {self.vm} acpipowerbutton", check=False)
-        # wait up to 60s for graceful shutdown
-        for i in range(60):
-            out = self._run(f"VBoxManage showvminfo {self.vm} --machinereadable", check=False)
-            if 'VMState="poweroff"' in out.stdout:
-                self.logger.info(f"VM gracefully shut down after {i + 1} seconds")
-                return
-            time.sleep(1)
-
-        self.logger.warning("Forcing poweroff after timeout")
-        self._run(f"VBoxManage controlvm {self.vm} poweroff")
-
-    def modify_resources(self):
-        # VirtualBox VMs must be powered off (not saved) to modify resources
-
-        # First, check current VM state
-        vm_info = self._run(f"VBoxManage showvminfo {self.vm} --machinereadable", check=False)
-        vm_state_lines = [line for line in vm_info.stdout.splitlines() if line.startswith('VMState=')]
-        current_state = vm_state_lines[0].split('=')[1].strip('"') if vm_state_lines else "unknown"
-
-        self.logger.info(f"Current VM state before modification: {current_state}")
-
-        # Handle different VM states
-        if current_state == "saved":
-            # For saved state, we need to first restore the VM
-            self.logger.info("VM is in saved state, restoring to powered off state")
-            # Two approaches - try the first, fall back to the alternative if needed
-            try:
-                # Try using controlvm poweroff (safer)
-                self.logger.info("Trying poweroff method")
-                self._run(f"VBoxManage controlvm {self.vm} poweroff", check=False)
-                time.sleep(3)
-            except Exception as e:
-                self.logger.warning(f"Failed to poweroff VM: {e}")
-
-            # Check if it worked
-            vm_state = self._run(f"VBoxManage showvminfo {self.vm} --machinereadable", check=False)
-            if 'VMState="poweroff"' not in vm_state.stdout:
-                self.logger.warning("Still not powered off, trying alternative method")
-
-                # Try discarding the saved state with error handling
-                try:
-                    result = self._run(f"VBoxManage snapshot {self.vm} restorecurrent", check=False)
-                    if result.returncode != 0:
-                        self.logger.warning(f"Failed to restore current snapshot: {result.stderr}")
-                except Exception as e:
-                    self.logger.warning(f"Error in snapshot restore: {e}")
-
-                time.sleep(3)
-
-        # For any state other than powered off, force power off
-        vm_state = self._run(f"VBoxManage showvminfo {self.vm} --machinereadable", check=False)
-        if 'VMState="poweroff"' not in vm_state.stdout:
-            self.logger.info("VM is not powered off, forcing power off")
-            self._run(f"VBoxManage controlvm {self.vm} poweroff", check=False)
-            time.sleep(5)  # Give VirtualBox more time to register the poweroff
-
-        # Check current settings to see if change is needed
-        current_info = self._run(f"VBoxManage showvminfo {self.vm} --machinereadable").stdout
-        current_cpu = None
-        current_memory = None
-
-        for line in current_info.splitlines():
-            if line.startswith('cpus='):
-                current_cpu = int(line.split('=')[1].strip('"'))
-            elif line.startswith('memory='):
-                current_memory = int(line.split('=')[1].strip('"'))
-
-        self.logger.info(f"Current settings: CPUs={current_cpu}, Memory={current_memory}MB")
-
-        # Build modification command for changed values only
-        cmd = []
-        if self.cpus and self.cpus != current_cpu:
-            cmd.append(f"--cpus {self.cpus}")
-
-        if self.memory and self.memory != current_memory:
-            cmd.append(f"--memory {self.memory}")
-
-        if not cmd:
-            self.logger.info("No changes needed to CPU or memory")
-            return
-
-        args = ' '.join(cmd)
-        self.logger.info(f"Applying: VBoxManage modifyvm {self.vm} {args}")
-        result = self._run(f"VBoxManage modifyvm {self.vm} {args}", check=False)
-
-        if result.returncode != 0:
-            self.logger.error(f"Modification failed: {result.stderr}")
-            raise RuntimeError(f"Failed to modify VM: {result.stderr}")
-
-    def restore_saved_state(self):
-        """Restore VM from saved state if available"""
-        if self.use_save_state:
-            self.logger.info(f"Restoring VM {self.vm} from saved state")
-            self._run(f"VBoxManage startvm {self.vm} --type headless")
-            time.sleep(10)  # Allow some time for state restoration
-            return True
+        self.logger.error(f"Timeout waiting for VM to reach '{target_state}' state")
         return False
 
-    def start_vm(self):
-        # First check if VM is already running
-        vm_info = self._run(f"VBoxManage showvminfo {self.vm} --machinereadable", check=False)
-        if 'VMState="running"' in vm_info.stdout:
-            self.logger.info("VM is already running")
-            return
+    def power_off_vm(self) -> bool:
+        """Power off the VM."""
+        state = self.get_vm_state()
+        if state == VM_STATE_POWEROFF:
+            self.logger.info("VM is already powered off")
+            return True
 
-        if not self.restore_saved_state():
-            self.logger.info(f"Starting VM {self.vm}")
+        try:
+            if state == VM_STATE_SAVED:
+                self._run(f"VBoxManage discardstate {self.vm}", check=False)
+            elif state == VM_STATE_PAUSED:
+                self._run(f"VBoxManage controlvm {self.vm} resume", check=False)
+                time.sleep(2)
+            
+            self._run(f"VBoxManage controlvm {self.vm} poweroff", check=False)
+            return self.wait_for_state(VM_STATE_POWEROFF, timeout=self.wait_timeout)
+        except Exception as e:
+            self.logger.error(f"Error powering off VM: {e}")
+            return False
+
+    def get_current_cpus(self) -> int:
+        """Get the current CPU count for the VM."""
+        try:
+            info = self._run(f"VBoxManage showvminfo {self.vm} --machinereadable").stdout
+            for line in info.splitlines():
+                if line.startswith('cpus='):
+                    return int(line.split('=')[1].strip('"'))
+            return 0
+        except Exception as e:
+            self.logger.error(f"Error getting CPU count: {str(e)}")
+            return 0
+
+    def get_current_memory(self) -> int:
+        """Get the current memory allocation for the VM."""
+        try:
+            info = self._run(f"VBoxManage showvminfo {self.vm} --machinereadable").stdout
+            for line in info.splitlines():
+                if line.startswith('memory='):
+                    return int(line.split('=')[1].strip('"'))
+            return 0
+        except Exception as e:
+            self.logger.error(f"Error getting memory allocation: {str(e)}")
+            return 0
+
+    def modify_cpu(self) -> bool:
+        """Modify the CPU count for the VM."""
+        if self.get_vm_state() != VM_STATE_POWEROFF:
+            self.logger.error("Cannot modify CPU when VM is not powered off")
+            return False
+
+        current = self.get_current_cpus()
+        if self.cpus != current:
+            self.logger.info(f"Changing CPU from {current} to {self.cpus} cores")
             try:
-                result = self._run(f"VBoxManage startvm {self.vm} --type headless", check=False)
-                if result.returncode != 0:
-                    self.logger.error(f"Failed to start VM: {result.stderr}")
-                    # Try alternative start method
-                    self.logger.info("Trying alternative start method")
-                    self._run(f"VBoxManage startvm {self.vm}")
+                self._run(f"VBoxManage modifyvm {self.vm} --cpus {self.cpus}")
+                return self.get_current_cpus() == self.cpus
             except Exception as e:
-                self.logger.error(f"Error starting VM: {e}")
+                self.logger.error(f"Error modifying CPU: {e}")
+                return False
+        return True
 
-        # Wait for VM to become fully responsive
-        self.logger.info("Waiting for VM to become responsive...")
+    def modify_memory(self) -> bool:
+        """Modify the memory allocation for the VM."""
+        if self.get_vm_state() != VM_STATE_POWEROFF:
+            self.logger.error("Cannot modify memory when VM is not powered off")
+            return False
 
-        # Check if VM is actually running
-        time.sleep(5)
-        vm_info = self._run(f"VBoxManage showvminfo {self.vm} --machinereadable", check=False)
-        if 'VMState="running"' not in vm_info.stdout:
-            self.logger.warning("VM doesn't appear to be running after start command")
-            self.logger.info("Trying to force start the VM again")
-            self._run(f"VBoxManage startvm {self.vm}", check=False)
+        current = self.get_current_memory()
+        if self.memory != current:
+            self.logger.info(f"Changing memory from {current} to {self.memory} MB")
+            try:
+                self._run(f"VBoxManage modifyvm {self.vm} --memory {self.memory}")
+                return self.get_current_memory() == self.memory
+            except Exception as e:
+                self.logger.error(f"Error modifying memory: {e}")
+                return False
+        return True
 
-        time.sleep(20)  # Give VM more time to fully initialize
-
-        # Verify VM is running
-        vm_info = self._run(f"VBoxManage showvminfo {self.vm} --machinereadable", check=False)
-        if 'VMState="running"' in vm_info.stdout:
-            self.logger.info("VM confirmed running")
-        else:
-            self.logger.warning("VM may not be running properly. Current state from VirtualBox:")
-            vm_state_lines = [line for line in vm_info.stdout.splitlines() if line.startswith('VMState=')]
-            if vm_state_lines:
-                self.logger.warning(f"VM state: {vm_state_lines[0]}")
-            else:
-                self.logger.warning("Could not determine VM state")
+    def start_vm(self, start_type: str = "headless") -> bool:
+        """Start the VM."""
+        self.logger.info(f"Starting VM {self.vm} in {start_type} mode")
+        try:
+            self._run(f"VBoxManage startvm {self.vm} --type {start_type}")
+            return self.wait_for_state(VM_STATE_RUNNING, timeout=self.wait_timeout)
+        except Exception as e:
+            self.logger.error(f"Error starting VM: {e}")
+            return False
 
     def health_check(self) -> bool:
-        if not self.health_url:
-            self.logger.info("No health URL provided, skipping health check")
-            return True
+        """Perform basic health check on the VM."""
+        if self.get_vm_state() != VM_STATE_RUNNING:
+            self.logger.error("Health check failed: VM is not running")
+            return False
 
-        try:
-            import requests
-        except ImportError:
-            self.logger.warning("Python 'requests' module not installed. Skipping health check.")
-            self.logger.warning("Install with: pip install requests")
-            return True
-
-        self.logger.info(f"Checking health at {self.health_url}")
-        start = time.time()
-        while time.time() - start < self.timeout:
-            try:
-                r = requests.get(self.health_url, timeout=5)
-                if r.status_code == 200:
-                    self.logger.info("Health check passed")
-                    return True
-                else:
-                    self.logger.debug(f"Health check returned status code {r.status_code}")
-            except Exception as e:
-                self.logger.debug(f"Health check attempt failed: {e}")
-            time.sleep(5)
-
-        self.logger.warning("Health check failed after timeout")
-        # Ask if user wants to continue anyway
-        try:
-            response = input("Health check failed. Continue anyway? (y/n): ")
-            if response.lower() in ['y', 'yes']:
-                self.logger.info("Continuing despite failed health check")
-                return True
-        except:
-            pass
-
-        self.logger.error("Health check failed and was not overridden")
-        return False
-
-    def rollback(self):
-        if not self.snapshot_name:
-            self.logger.error("No snapshot to rollback to")
-            return
-        self.logger.info(f"Rolling back to snapshot {self.snapshot_name}")
-        self._run(f"VBoxManage controlvm {self.vm} poweroff", check=False)
-        time.sleep(5)
-        self._run(f"VBoxManage snapshot {self.vm} restore {self.snapshot_name}")
-        self.start_vm()
-        self.logger.info("Rollback complete")
+        if self.health_url:
+            self.logger.info(f"Checking health at {self.health_url}")
+            deadline = time.time() + self.timeout
+            
+            while time.time() < deadline:
+                try:
+                    r = requests.get(self.health_url, timeout=5)
+                    if r.status_code == 200:
+                        self.logger.info("Health check passed")
+                        return True
+                except Exception as e:
+                    self.logger.debug(f"Health check request failed: {e}")
+                time.sleep(5)
+            
+            self.logger.error("Health check failed after timeout")
+            return False
+            
+        return True
 
     def execute(self):
+        """Main execution flow for VM resizing operation."""
         try:
-            # First check if VM exists
-            vm_exists = self._run(f"VBoxManage list vms | grep -w \"{self.vm}\"", check=False)
-            if vm_exists.returncode != 0:
-                self.logger.error(f"VM '{self.vm}' not found. Available VMs:")
-                vms = self._run("VBoxManage list vms")
+            # Check if VM needs to be modified
+            current_cpus = self.get_current_cpus()
+            current_mem = self.get_current_memory()
+            self.logger.info(f"Current VM configuration: CPUs={current_cpus}, Memory={current_mem} MB")
+
+            if current_cpus == self.cpus and current_mem == self.memory:
+                self.logger.info(f"VM already has {self.cpus} CPUs and {self.memory} MB memory. No changes needed.")
+                return
+
+            # Power off VM to make changes
+            if not self.power_off_vm():
+                self.logger.error("Failed to power off VM")
                 sys.exit(1)
 
-            # Take initial snapshot for safety
-            self.take_snapshot()
+            # Make hardware changes
+            cpu_changed = self.modify_cpu()
+            mem_changed = self.modify_memory()
 
-            # Get VM state before doing anything
-            vm_info = self._run(f"VBoxManage showvminfo {self.vm} --machinereadable")
-            vm_state_line = [line for line in vm_info.stdout.splitlines() if line.startswith('VMState=')]
-            if vm_state_line:
-                initial_state = vm_state_line[0].split('=')[1].strip('"')
-                self.logger.info(f"Initial VM state: {initial_state}")
-
-                # Only capture app state if VM is running
-                if initial_state == "running":
-                    self.capture_running_apps()
-                    self.put_in_drain()
-                    self.sync_data()
-                else:
-                    self.logger.info(f"VM is not running (state={initial_state}), skipping app checks and drain")
-
-            # Save state or stop
-            if self.use_save_state and initial_state == "running":
-                self.save_vm_state()
-            elif initial_state == "running":
-                self.stop_vm()
-
-            # Modify resources
-            try:
-                self.modify_resources()
-            except Exception as e:
-                self.logger.error(f"Resource modification failed: {e}")
-                self.rollback()
+            if not (cpu_changed and mem_changed):
+                self.logger.error("Failed to modify VM hardware")
                 sys.exit(1)
 
-            # Start VM back up
-            self.start_vm()
+            # Start the VM
+            if not self.start_vm():
+                self.logger.error("Failed to start VM after resize")
+                sys.exit(1)
 
-            # Run health checks if URL provided
+            # Wait for VM to stabilize
+            time.sleep(30)
+
+            # Perform health check
             if not self.health_check():
-                raise RuntimeError("Health check failure")
+                self.logger.error("Health check failed after resize")
+                sys.exit(1)
 
-            # Verify applications if initial state was captured
-            if self.running_apps_before:
-                if not self.verify_running_apps():
-                    self.logger.warning("Application state verification failed, but continuing")
-
-            self.logger.info("Resize successful with application state preserved")
-
-            # Show final VM configuration
-            final_info = self._run(f"VBoxManage showvminfo {self.vm} --machinereadable").stdout
-            for line in final_info.splitlines():
-                if line.startswith('cpus=') or line.startswith('memory='):
-                    self.logger.info(f"Final configuration: {line}")
+            self.logger.info("Resize operation completed successfully")
 
         except Exception as e:
-            self.logger.error(f"Error during resize: {e}")
-            self.rollback()
+            self.logger.error(f"Resize error: {e}")
             sys.exit(1)
 
-
 def main():
-    parser = argparse.ArgumentParser(description='Resize VirtualBox VM while preserving application state')
+    parser = argparse.ArgumentParser(description='Resize VirtualBox VM')
     parser.add_argument('vm_name', help='Name of the VM')
     parser.add_argument('--cpus', type=int, required=True, help='New CPU count')
-    parser.add_argument('--memory', type=int, help='New memory in MB')
-    parser.add_argument('--drain-script', help='Script to drain connections')
-    parser.add_argument('--sync-script', help='Script to sync data')
-    parser.add_argument('--health-url', help='URL to verify after start')
+    parser.add_argument('--memory', type=int, required=True, help='New memory in MB')
+    parser.add_argument('--health-url', help='URL to verify application state (optional)')
     parser.add_argument('--timeout', type=int, default=300, help='Health check timeout (s)')
-    parser.add_argument('--use-save-state', action='store_true',
-                        help='Use savestate instead of shutdown (better preserves app state)')
-    parser.add_argument('--app-check-script', help='Script to verify running applications')
+    parser.add_argument('--debug', action='store_true', help='Enable debug output')
+    parser.add_argument('--wait-timeout', type=int, default=60, help='Timeout for state transitions (s)')
+    
+    # Application management parameters
+    parser.add_argument('--app-name', help='Application name for logging')
+    parser.add_argument('--app-process', help='Process name to check if application is running')
+    parser.add_argument('--app-start-cmd', help='Command to start the application')
+    parser.add_argument('--app-status-cmd', help='Command to check application status')
+
     args = parser.parse_args()
+    
+    # Build application configuration if provided
+    app_config = None
+    if args.app_name or args.app_process or args.app_start_cmd:
+        app_config = {
+            'name': args.app_name or 'application',
+            'process_name': args.app_process,
+            'start_command': args.app_start_cmd,
+            'status_command': args.app_status_cmd
+        }
 
     resizer = VMResizer(
         vm_name=args.vm_name,
         cpus=args.cpus,
         memory=args.memory,
-        drain_script=args.drain_script,
-        sync_script=args.sync_script,
         health_url=args.health_url,
         timeout=args.timeout,
-        use_save_state=args.use_save_state,
-        app_check_script=args.app_check_script
+        debug=args.debug,
+        wait_timeout=args.wait_timeout,
+        app_config=app_config
     )
-    resizer.execute()
 
+    resizer.execute()
 
 if __name__ == '__main__':
     main()

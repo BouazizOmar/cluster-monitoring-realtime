@@ -1,4 +1,7 @@
 openai>=1.0.0
 python-dotenv>=0.19.0
 typing-extensions>=4.0.0
-dataclasses>=0.6 
+dataclasses>=0.6
+requests
+paramiko
+psutil>=5.9.0

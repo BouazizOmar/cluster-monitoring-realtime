@@ -1,0 +1,4 @@
+vm_name=ubuntu-24.10
+cpus=3
+memory=4000
+timestamp=1747486266.8550909

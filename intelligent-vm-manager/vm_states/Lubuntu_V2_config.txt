@@ -1,0 +1,4 @@
+vm_name=Lubuntu_V2
+cpus=2
+memory=5000
+timestamp=1747485745.066029
