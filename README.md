@@ -47,14 +47,9 @@ A lightweight, self-healing platform for Linux VM clusters that collects perform
    - Java 11+ (for Kafka)  
    - Python 3.8+  
 
-2. **Clone the Repo**  
-   
-bash
-   git clone https://github.com/your-org/vm-monitoring
-   cd vm-monitoring
 
 
-3. **Launch with Docker Compose**  
+2. **Launch with Docker Compose**  
    
 bash
    docker-compose up -d
